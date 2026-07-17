@@ -1,0 +1,887 @@
+---
+title: "CHIP Gene and VAF Subgroup Survival Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/Downloads/CHIP:HCC project/7. Correlative Analysis")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 7, fig.height = 6)
+```
+
+# Introduction
+
+This report classifies each patient's dominant CHIP clone by **gene** (TET2,
+DNMT3A, or Other) and by **VAF level** (High, >10%; Low, <10%), then groups
+patients into four categories:
+
+- **CHIP-**: no CHIP
+- **TET2_High**: dominant clone is TET2 with VAF > 10%
+- **Other_High**: dominant clone is non-DNMT3A/non-TET2 with VAF > 10%
+- **Other_CHIP**: all remaining CHIP+ patients (every low-VAF case, plus all
+  DNMT3A cases regardless of VAF)
+
+It then evaluates whether these groups are associated with overall survival
+(OS), progression-free survival (PFS), time to progression (TTP), and
+fibrosis level. Each analysis is run once on all patients, then repeated
+separately for resection and transplant patients.
+
+# Data Preparation
+
+## Load clinical data
+
+```{r load-data}
+library(dplyr)
+library(stringr)
+library(survival)
+library(lubridate)
+library(ggsurvfit)
+library(ggplot2)
+
+dir.create("Plots/GeneVAF_Subgroups", showWarnings = FALSE, recursive = TRUE)
+
+clinical <- read.csv("clinical_final.csv")
+
+# Most dates are entered as YYYY-MM-DD, but a few rows use MM-DD-YYYY. Try ymd()
+# first and fall back to mdy() for anything that fails to parse, instead of
+# silently dropping those patients from the time-to-event outcomes.
+parse_date_flex <- function(x) as_date(parse_date_time(x, orders = c("ymd", "mdy"), quiet = TRUE))
+```
+
+## Classify each patient's dominant CHIP clone
+
+Each patient's `CHIP_vaf` field is formatted as `GENE_vaf||GENE_vaf...`. For
+patients with more than one CHIP mutation, the clone with the highest VAF is
+taken as the dominant clone; its gene and VAF determine that patient's group.
+
+```{r parse-clone}
+split_underscore <- function(x, index) strsplit(x, "_", fixed = TRUE)[[1]][index]
+
+parse_dominant_clone <- function(x) {
+  if (is.na(x) || nchar(x) == 0) {
+    return(data.frame(gene = NA_character_, vaf = 0))
+  }
+  parts <- strsplit(x, "||", fixed = TRUE)[[1]]
+  genes <- unlist(lapply(parts, split_underscore, index = 1))
+  vafs <- as.numeric(unlist(lapply(parts, split_underscore, index = 2)))
+  data.frame(gene = genes[which.max(vafs)], vaf = max(vafs))
+}
+
+dominant <- do.call(rbind, lapply(clinical$CHIP_vaf, parse_dominant_clone))
+clinical$dominant_gene <- dominant$gene
+clinical$max_vaf <- dominant$vaf
+
+classify_gene <- function(gene) {
+  ifelse(gene == "TET2", "TET2", ifelse(gene == "DNMT3A", "DNMT3A", "Other"))
+}
+
+# Like parse_dominant_clone(), but returns every clone for a patient instead
+# of just the dominant one.
+parse_all_clones <- function(x) {
+  if (is.na(x) || nchar(x) == 0) return(data.frame(gene = character(0), vaf = numeric(0)))
+  parts <- strsplit(x, "||", fixed = TRUE)[[1]]
+  genes <- unlist(lapply(parts, split_underscore, index = 1))
+  vafs <- as.numeric(unlist(lapply(parts, split_underscore, index = 2)))
+  data.frame(gene = genes, vaf = vafs)
+}
+```
+
+## Define VAF and gene subgroups
+
+```{r define-groups}
+# 1. VAF split: high (>10%) vs low (<10%)
+clinical$vaf_group <- ifelse(clinical$CHIP == 0, "CHIP-",
+                       ifelse(clinical$max_vaf > 0.10, "High", "Low"))
+
+# 2. Gene category: TET2, DNMT3A, or Other
+clinical$gene_category <- ifelse(clinical$CHIP == 0, "None",
+                           ifelse(clinical$dominant_gene == "TET2", "TET2",
+                           ifelse(clinical$dominant_gene == "DNMT3A", "DNMT3A", "Other")))
+
+# 3. Combined group:
+#    - CHIP-: no CHIP
+#    - TET2_High: dominant clone is TET2 with VAF > 10%
+#    - Other_High: dominant clone is non-DNMT3A/non-TET2 (i.e. "Other") with VAF > 10%
+#    - Other_CHIP: all remaining CHIP+ patients (all low VAF, plus all DNMT3A
+#      regardless of VAF)
+clinical$chip_group <- ifelse(clinical$CHIP == 0, "CHIP-",
+                        ifelse(clinical$gene_category == "TET2" & clinical$vaf_group == "High", "TET2_High",
+                        ifelse(clinical$gene_category == "Other" & clinical$vaf_group == "High", "Other_High",
+                        "Other_CHIP")))
+
+group_levels <- c("CHIP-", "TET2_High", "Other_High", "Other_CHIP")
+clinical$chip_group <- factor(clinical$chip_group, levels = group_levels)
+```
+
+Patient counts per CHIP gene/VAF group:
+
+```{r group-counts}
+table(clinical$chip_group)
+```
+
+Patient counts per group, by surgery type (0 = resection, 1 = transplant):
+
+```{r group-counts-by-surgery}
+table(clinical$chip_group, clinical$type_sx)
+```
+
+### Multi-Mutation Patient Detail
+
+`chip_group` above is decided solely by each patient's single highest-VAF
+("dominant") clone. For every patient with more than one CHIP mutation, this
+lists all of their mutations and VAFs, ordered by patient ID, along with the
+group **each individual clone** would produce on its own (the same gene x
+VAF rule as above). When those per-clone labels disagree (flagged by
+`ambiguous`), the patient could have been classified into more than one
+combined group depending on which clone is treated as dominant - this can
+happen either because the clones are in different genes, or because the
+same gene straddles the 10% VAF threshold.
+
+```{r multi-mutation-detail}
+clone_would_be_group <- function(gene, vaf) {
+  category <- classify_gene(gene)
+  vaf_grp <- ifelse(vaf > 0.10, "High", "Low")
+  ifelse(category == "TET2" & vaf_grp == "High", "TET2_High",
+  ifelse(category == "Other" & vaf_grp == "High", "Other_High", "Other_CHIP"))
+}
+
+multi_mutation_detail <- do.call(rbind, lapply(seq_len(nrow(clinical)), function(i) {
+  clones <- parse_all_clones(clinical$CHIP_vaf[i])
+  if (nrow(clones) < 2) return(NULL)
+  clones$would_be_group <- clone_would_be_group(clones$gene, clones$vaf)
+  data.frame(study_id = clinical$study_id[i], gene = clones$gene, vaf = clones$vaf,
+             would_be_group = clones$would_be_group,
+             ambiguous = length(unique(clones$would_be_group)) > 1,
+             assigned_group = as.character(clinical$chip_group[i]))
+}))
+multi_mutation_detail <- multi_mutation_detail[order(multi_mutation_detail$study_id,
+                                                      -multi_mutation_detail$vaf), ]
+multi_mutation_detail
+```
+
+## Alternate CHIP Grouping
+
+A second, simpler 3-group classification, used later for a separate set of
+results (see the "Results (Alternate CHIP Grouping)" section):
+
+- **CHIP-**: no CHIP
+- **NonDNMT3A_High**: dominant clone is any gene other than DNMT3A with VAF > 10%
+- **Other_CHIP**: all remaining CHIP+ patients (DNMT3A regardless of VAF,
+  plus all low-VAF cases)
+
+```{r define-alt-groups}
+clinical$chip_group_alt <- ifelse(clinical$CHIP == 0, "CHIP-",
+                            ifelse(clinical$gene_category != "DNMT3A" & clinical$vaf_group == "High",
+                                   "NonDNMT3A_High", "Other_CHIP"))
+
+alt_group_levels <- c("CHIP-", "NonDNMT3A_High", "Other_CHIP")
+clinical$chip_group_alt <- factor(clinical$chip_group_alt, levels = alt_group_levels)
+```
+
+Patient counts per alternate CHIP group:
+
+```{r alt-group-counts}
+table(clinical$chip_group_alt)
+```
+
+Patient counts per alternate group, by surgery type (0 = resection, 1 = transplant):
+
+```{r alt-group-counts-by-surgery}
+table(clinical$chip_group_alt, clinical$type_sx)
+```
+
+## Patients with Multiple CHIP Calls
+
+Some patients carry more than one CHIP mutation at once (e.g. a TET2 clone
+alongside a DNMT3A or other-gene clone). Every group assignment above is
+based solely on that patient's single highest-VAF ("dominant") clone -
+any other co-occurring mutations are not otherwise reflected in `chip_group`.
+This section characterizes those multi-mutation patients and shows where
+the dominant-clone rule placed them.
+
+```{r multi-chip-parse}
+multi_summary <- do.call(rbind, lapply(seq_len(nrow(clinical)), function(i) {
+  clones <- parse_all_clones(clinical$CHIP_vaf[i])
+  if (nrow(clones) == 0) {
+    return(data.frame(study_id = clinical$study_id[i], n_mutations = 0,
+                       n_genes = 0, n_categories = 0, categories = NA_character_))
+  }
+  clones$category <- classify_gene(clones$gene)
+  data.frame(study_id = clinical$study_id[i], n_mutations = nrow(clones),
+             n_genes = length(unique(clones$gene)),
+             n_categories = length(unique(clones$category)),
+             categories = paste(sort(unique(clones$category)), collapse = "+"))
+}))
+
+clinical <- left_join(clinical, multi_summary, by = "study_id")
+
+# Multi-mutation: more than one CHIP clone detected.
+# Multi-category: those clones span more than one of TET2 / DNMT3A / Other -
+# this is the "both TET2 and non-TET2" scenario referenced above.
+clinical$multi_mutation <- clinical$n_mutations > 1
+clinical$multi_category <- clinical$n_categories > 1
+```
+
+Number of CHIP mutations per patient (CHIP+ only):
+
+```{r multi-chip-mutation-count}
+table(clinical$n_mutations[clinical$CHIP == 1])
+```
+
+Of patients with more than one CHIP mutation, how many span more than one
+gene category:
+
+```{r multi-chip-category-count}
+table(clinical$categories[clinical$multi_mutation])
+```
+
+Final `chip_group` assigned to multi-category patients under the
+dominant-clone rule:
+
+```{r multi-chip-final-group}
+table(clinical$chip_group[clinical$multi_category])
+```
+
+```{r multi-chip-plots}
+# Plot 1: how many CHIP mutations does each CHIP+ patient carry.
+plot_mutation_count <- ggplot(filter(clinical, CHIP == 1),
+                               aes(x = factor(n_mutations))) +
+  geom_bar() +
+  labs(x = "Number of CHIP mutations detected", y = "Number of patients",
+       title = "CHIP mutation burden per patient") +
+  theme_classic()
+ggsave("Plots/GeneVAF_Subgroups/MultiCHIP_MutationCount.pdf",
+       plot = plot_mutation_count, height = 5, width = 6)
+print(plot_mutation_count)
+
+# Plot 2: among multi-mutation patients, do their clones stay within one gene
+# category or span multiple (e.g. TET2 + Other)?
+plot_category_breakdown <- ggplot(filter(clinical, multi_mutation),
+                                   aes(x = categories)) +
+  geom_bar() +
+  labs(x = "Gene categories represented among a patient's CHIP clones",
+       y = "Number of patients",
+       title = "Multi-mutation patients: single vs. multiple gene categories") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+ggsave("Plots/GeneVAF_Subgroups/MultiCHIP_CategoryBreakdown.pdf",
+       plot = plot_category_breakdown, height = 5, width = 6)
+print(plot_category_breakdown)
+
+# Plot 3: for the multi-category patients specifically, which final chip_group
+# did the dominant-clone rule assign them to?
+plot_multicat_assignment <- ggplot(filter(clinical, multi_category),
+                                    aes(x = droplevels(chip_group))) +
+  geom_bar() +
+  labs(x = "Final assigned group", y = "Number of patients",
+       title = "Multi-category patients: final group after dominant-clone rule") +
+  theme_classic()
+ggsave("Plots/GeneVAF_Subgroups/MultiCHIP_FinalGroupAssignment.pdf",
+       plot = plot_multicat_assignment, height = 5, width = 6)
+print(plot_multicat_assignment)
+```
+
+# Analysis Helper Functions
+
+The functions below are reused across every outcome and cohort in the
+Results section. `run_km_cox()` fits a Cox model and draws/saves a
+Kaplan-Meier plot for a time-to-event outcome, labeling each group with its
+sample size and showing the model's overall logrank p-value as a subtitle.
+`run_fibrosis()` cross-tabs fibrosis score (levels 0-4, taken directly from
+the clinical data) against group, runs a chi-square test, and draws/saves a
+bar plot of the fibrosis score distribution within each group, with each
+group's sample size shown on the x-axis.
+
+```{r helpers}
+# Refit the group factor to only the levels present in a subset, keeping
+# "CHIP-" as the reference level whenever it is present.
+refactor_group <- function(df, group_col = "chip_group") {
+  df[[group_col]] <- droplevels(df[[group_col]])
+  if ("CHIP-" %in% levels(df[[group_col]])) {
+    df[[group_col]] <- relevel(df[[group_col]], ref = "CHIP-")
+  }
+  df
+}
+
+run_km_cox <- function(df, time_col, event_col, group_col, ylab, label, outfile) {
+  df <- refactor_group(df, group_col)
+  n_levels <- nlevels(df[[group_col]])
+  cat("n =", nrow(df), " groups present:", paste(levels(df[[group_col]]), collapse = ", "), "\n")
+
+  if (n_levels < 2) {
+    cat("Skipped: fewer than 2 groups present.\n")
+    return(invisible(NULL))
+  }
+
+  form <- as.formula(paste0("Surv(", time_col, ", ", event_col, ") ~ ", group_col))
+
+  cox_res <- tryCatch(coxph(form, data = df), error = function(e) {
+    cat("Cox model failed:", conditionMessage(e), "\n")
+    NULL
+  })
+  if (!is.null(cox_res)) print(summary(cox_res))
+
+  p_val <- if (!is.null(cox_res)) {
+    tryCatch(summary(cox_res)$sctest[["pvalue"]], error = function(e) NA)
+  } else NA
+  p_label <- if (is.na(p_val)) "NA" else format.pval(p_val, digits = 3, eps = 0.001)
+
+  # Relabel groups with sample size for the plot only (leaves the Cox model
+  # term names in the summary above untouched).
+  plot_df <- df
+  group_counts <- table(plot_df[[group_col]])
+  levels(plot_df[[group_col]]) <- paste0(levels(plot_df[[group_col]]), " (n=", as.integer(group_counts), ")")
+
+  plot <- tryCatch({
+    survfit2(form, data = plot_df) %>%
+      ggsurvfit() +
+      labs(x = "Days", y = ylab, title = label,
+           subtitle = paste0("Logrank p = ", p_label)) +
+      ylim(c(0, 1.0))
+  }, error = function(e) {
+    cat("KM plot failed:", conditionMessage(e), "\n")
+    NULL
+  })
+
+  if (!is.null(plot)) {
+    ggsave(outfile, plot = plot, height = 6, width = 7)
+    print(plot)
+  }
+
+  invisible(cox_res)
+}
+
+run_fibrosis <- function(df, group_col, label, table_outfile, plot_outfile) {
+  df <- refactor_group(df, group_col)
+  n_levels <- nlevels(df[[group_col]])
+  cat("n =", nrow(df), " groups present:", paste(levels(df[[group_col]]), collapse = ", "), "\n")
+
+  if (n_levels < 2) {
+    cat("Skipped: fewer than 2 groups present.\n")
+    return(invisible(NULL))
+  }
+
+  tab <- table(df[[group_col]], df$fibrosis_score)
+  colnames(tab) <- paste0("F", colnames(tab))
+  print(tab)
+  write.csv(tab, file = table_outfile)
+
+  chisq_res <- tryCatch(
+    chisq.test(tab, simulate.p.value = TRUE, B = 10000),
+    error = function(e) {
+      cat("Chi-square test failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  if (!is.null(chisq_res)) print(chisq_res)
+
+  group_counts <- table(df[[group_col]])
+  x_labels <- setNames(paste0(names(group_counts), "\n(n=", as.integer(group_counts), ")"),
+                       names(group_counts))
+
+  plot <- tryCatch({
+    ggplot(df, aes(x = .data[[group_col]], fill = factor(fibrosis_score))) +
+      geom_bar(position = "fill") +
+      scale_x_discrete(labels = x_labels) +
+      labs(x = NULL, y = "Proportion of patients", fill = "Fibrosis score",
+           title = label) +
+      theme_classic()
+  }, error = function(e) {
+    cat("Fibrosis plot failed:", conditionMessage(e), "\n")
+    NULL
+  })
+
+  if (!is.null(plot)) {
+    ggsave(plot_outfile, plot = plot, height = 5, width = 7)
+    print(plot)
+  }
+
+  invisible(list(chisq = chisq_res))
+}
+```
+
+# Preoperative Lab Values by CHIP Group
+
+`clinical_data.csv` (not `clinical_final.csv`) holds the preoperative blood
+work. Its `study_id` is formatted `HCC-ctDNA-NNN`; that prefix is stripped to
+match the numeric `study_id` used elsewhere in this report. Several lab
+columns were entered as free text (e.g. `"nr"`, `"not reported"`, or a value
+with a parenthetical date like `"2.0 (19/01/2018)"`) - `parse_numeric_flex()`
+pulls out the leading numeric token and treats anything else as missing.
+
+```{r lab-data-prep}
+parse_numeric_flex <- function(x) as.numeric(str_extract(trimws(as.character(x)), "^[0-9]+\\.?[0-9]*"))
+
+lab_vars <- c(
+  preop_bld_1_inr = "INR",
+  preop_bld_1_bili = "Bilirubin",
+  preop_bld_1_albumin = "Albumin",
+  preop_bld_1_platelet = "Platelet count",
+  preop_bld_1_creatinine = "Creatinine",
+  preop_bld_1_alt = "ALT",
+  preop_bld_1_ast = "AST",
+  preop_bld_1_afp = "AFP",
+  preop_bld_1_wbc = "WBC",
+  preop_bld_1_hb = "Hemoglobin"
+)
+
+lab_data <- read.csv("clinical_data.csv")
+lab_data$study_id <- as.numeric(gsub("HCC-ctDNA-", "", lab_data$study_id))
+lab_data[names(lab_vars)] <- lapply(lab_data[names(lab_vars)], parse_numeric_flex)
+lab_data <- select(lab_data, study_id, all_of(names(lab_vars)))
+lab_data <- inner_join(lab_data, select(clinical, study_id, chip_group, chip_group_alt), by = "study_id")
+```
+
+`run_lab_distribution()` compares one lab value's distribution across CHIP
+groups with a boxplot (with individual patients jittered on top) and a
+Kruskal-Wallis test - a non-parametric test that suits the skewed,
+outlier-heavy nature of lab values better than an ANOVA would. Each group is
+labeled with its sample size.
+
+```{r lab-distribution-helper}
+run_lab_distribution <- function(df, var, var_label, group_col, plot_outfile) {
+  df <- refactor_group(df, group_col)
+  df <- df[!is.na(df[[var]]), ]
+  df[[group_col]] <- droplevels(df[[group_col]])
+  n_levels <- nlevels(df[[group_col]])
+  cat("n =", nrow(df), " groups present:", paste(levels(df[[group_col]]), collapse = ", "), "\n")
+
+  summary_tab <- df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(n = n(), median = median(.data[[var]]), mean = mean(.data[[var]]),
+              sd = sd(.data[[var]]), q1 = quantile(.data[[var]], 0.25),
+              q3 = quantile(.data[[var]], 0.75), .groups = "drop")
+  print(summary_tab)
+
+  if (n_levels < 2) {
+    cat("Skipped: fewer than 2 groups present.\n")
+    return(invisible(NULL))
+  }
+
+  kw_res <- tryCatch(kruskal.test(df[[var]], df[[group_col]]), error = function(e) {
+    cat("Kruskal-Wallis test failed:", conditionMessage(e), "\n")
+    NULL
+  })
+  if (!is.null(kw_res)) print(kw_res)
+  p_label <- if (is.null(kw_res)) "NA" else format.pval(kw_res$p.value, digits = 3, eps = 0.001)
+
+  group_counts <- table(df[[group_col]])
+  x_labels <- setNames(paste0(names(group_counts), "\n(n=", as.integer(group_counts), ")"),
+                       names(group_counts))
+
+  plot <- tryCatch({
+    ggplot(df, aes(x = .data[[group_col]], y = .data[[var]])) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(width = 0.15, alpha = 0.4) +
+      scale_x_discrete(labels = x_labels) +
+      labs(x = NULL, y = var_label, title = var_label,
+           subtitle = paste0("Kruskal-Wallis p = ", p_label)) +
+      theme_classic()
+  }, error = function(e) {
+    cat("Lab distribution plot failed:", conditionMessage(e), "\n")
+    NULL
+  })
+
+  if (!is.null(plot)) {
+    if (var ==  'preop_bld_1_afp') {
+          plot = plot + ylim(c(0,800))
+    }
+    else if (max(df[[var]] > 500)) { 
+      plot = plot + ylim(c(0,200))
+    } else if (var ==  'preop_bld_1_wbc') {
+      plot = plot + ylim(c(0,20))
+    }
+    ggsave(plot_outfile, plot = plot, height = 5, width = 7)
+    print(plot)
+  }
+
+  invisible(list(kruskal = kw_res))
+}
+```
+
+The same lab distributions are produced twice: once with the original 4-group
+classification (`chip_group`) and once with the alternate 3-group
+classification (`chip_group_alt`). Original-grouping plots are written to
+`Plots/GeneVAF_Subgroups/`; alternate-grouping plots to the `AltGrouping`
+subfolder, leaving the original output files untouched.
+
+```{r lab-distribution-run}
+dir.create("Plots/GeneVAF_Subgroups/AltGrouping", showWarnings = FALSE, recursive = TRUE)
+
+lab_groupings <- list(
+  list(group_col = "chip_group",     out_dir = "Plots/GeneVAF_Subgroups",            label = "Original grouping"),
+  list(group_col = "chip_group_alt", out_dir = "Plots/GeneVAF_Subgroups/AltGrouping", label = "Alternate grouping")
+)
+
+for (grouping in lab_groupings) {
+  cat("\n========", grouping$label, "========\n")
+  for (lab_col in names(lab_vars)) {
+    cat("\n----", lab_vars[[lab_col]], "----\n")
+    run_lab_distribution(lab_data, lab_col, lab_vars[[lab_col]], grouping$group_col,
+                          plot_outfile = paste0(grouping$out_dir, "/Labs_", lab_col, ".pdf"))
+  }
+}
+```
+
+# Outcome Dataset Construction
+
+```{r build-outcomes}
+# ---- Time to Progression (TTP): surgery date -> recurrence, censored at last f/u ----
+build_TTP <- function(clinical, group_col = "chip_group") {
+  TTP <- select(clinical, study_id, chip_group = all_of(group_col), type_sx,
+                date_sx, recurrence, status, date_recur_1, date_of_death, date_last_fu)
+
+  TTP$recurrence[TTP$recurrence == 0] <- 2
+  TTP$recurrence[TTP$recurrence == 1] <- 0
+  TTP$recurrence[TTP$recurrence == 2] <- 1
+
+  TTP$status[TTP$status == 0] <- 2
+  TTP$status[TTP$status == 1] <- 0
+  TTP$status[TTP$status == 2] <- 1
+
+  TTP <- TTP %>%
+    mutate(date_sx = parse_date_flex(date_sx),
+           date_recur_1 = parse_date_flex(date_recur_1),
+           date_of_death = parse_date_flex(date_of_death),
+           date_last_fu = parse_date_flex(date_last_fu))
+
+  TTP$date_last_fu[TTP$recurrence == 0 & TTP$status == 1 & is.na(TTP$date_last_fu)] <-
+    TTP$date_of_death[TTP$recurrence == 0 & TTP$status == 1 & is.na(TTP$date_last_fu)]
+
+  TTP <- TTP[!is.na(TTP$recurrence), ]
+  TTP$time <- NA
+  for (i in 1:nrow(TTP)) {
+    if (TTP$recurrence[i] == 1) TTP$time[i] <- TTP$date_recur_1[i] - TTP$date_sx[i]
+    if (TTP$recurrence[i] == 0) TTP$time[i] <- TTP$date_last_fu[i] - TTP$date_sx[i]
+  }
+  TTP <- TTP[!is.na(TTP$time), ]
+  TTP
+}
+
+# ---- Overall Survival (OS): surgery date -> death, censored at last f/u ----
+build_OS <- function(clinical, group_col = "chip_group") {
+  OS <- select(clinical, study_id, chip_group = all_of(group_col), type_sx,
+               date_sx, status, date_of_death, date_last_fu)
+
+  OS$status[OS$status == 0] <- 2
+  OS$status[OS$status == 1] <- 0
+  OS$status[OS$status == 2] <- 1
+
+  OS <- OS %>%
+    mutate(date_sx = parse_date_flex(date_sx),
+           date_of_death = parse_date_flex(date_of_death),
+           date_last_fu = parse_date_flex(date_last_fu))
+
+  OS <- OS[!is.na(OS$status), ]
+  OS$time <- NA
+  for (i in 1:nrow(OS)) {
+    if (OS$status[i] == 1) OS$time[i] <- OS$date_of_death[i] - OS$date_sx[i]
+    if (OS$status[i] == 0) OS$time[i] <- OS$date_last_fu[i] - OS$date_sx[i]
+  }
+  OS <- OS[!is.na(OS$time), ]
+  OS <- filter(OS, time > 0)
+  OS
+}
+
+# ---- Progression Free Survival (PFS): surgery date -> recurrence OR death ----
+build_PFS <- function(clinical, group_col = "chip_group") {
+  PFS <- select(clinical, study_id, chip_group = all_of(group_col), type_sx,
+                date_sx, recurrence, status, date_recur_1, date_of_death, date_last_fu)
+
+  PFS$recurrence[PFS$recurrence == 0] <- 2
+  PFS$recurrence[PFS$recurrence == 1] <- 0
+  PFS$recurrence[PFS$recurrence == 2] <- 1
+
+  PFS$status[PFS$status == 0] <- 2
+  PFS$status[PFS$status == 1] <- 0
+  PFS$status[PFS$status == 2] <- 1
+
+  PFS <- PFS %>%
+    mutate(date_sx = parse_date_flex(date_sx),
+           date_recur_1 = parse_date_flex(date_recur_1),
+           date_of_death = parse_date_flex(date_of_death),
+           date_last_fu = parse_date_flex(date_last_fu))
+
+  PFS$progression <- 0
+  PFS$date_progression <- ymd(NA)
+  PFS$progression[PFS$recurrence == 1 | PFS$status == 1] <- 1
+  PFS$date_progression[PFS$status == 1] <- PFS$date_of_death[PFS$status == 1]
+  PFS$date_progression[PFS$recurrence == 1] <- PFS$date_recur_1[PFS$recurrence == 1]
+
+  PFS$time <- NA
+  for (i in 1:nrow(PFS)) {
+    if (PFS$progression[i] == 1) PFS$time[i] <- PFS$date_progression[i] - PFS$date_sx[i]
+    if (PFS$progression[i] == 0) PFS$time[i] <- PFS$date_last_fu[i] - PFS$date_sx[i]
+  }
+  PFS <- PFS[!is.na(PFS$time), ]
+  PFS
+}
+
+# ---- Fibrosis: score taken as-is, levels 0-4 directly from the clinical data ----
+build_fibrosis <- function(clinical, group_col = "chip_group") {
+  fib <- select(clinical, study_id, chip_group = all_of(group_col), type_sx, fibrosis_score)
+  fib <- filter(fib, !is.na(fibrosis_score))
+  fib
+}
+
+TTP_all <- build_TTP(clinical)
+OS_all <- build_OS(clinical)
+PFS_all <- build_PFS(clinical)
+Fibrosis_all <- build_fibrosis(clinical)
+```
+
+# Results
+
+## All Patients
+
+### Time to Progression
+
+```{r ttp-all}
+run_km_cox(TTP_all, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP - All",
+           outfile = "Plots/GeneVAF_Subgroups/TTP_All.pdf")
+```
+
+### Overall Survival
+
+```{r os-all}
+run_km_cox(OS_all, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS - All",
+           outfile = "Plots/GeneVAF_Subgroups/OS_All.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-all}
+run_km_cox(PFS_all, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS - All",
+           outfile = "Plots/GeneVAF_Subgroups/PFS_All.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-all}
+run_fibrosis(Fibrosis_all, "chip_group", label = "Fibrosis - All",
+             table_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_All.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_All.pdf")
+```
+
+## Resection Only
+
+```{r subset-resection}
+TTP_resection <- TTP_all[TTP_all$type_sx == 0, ]
+OS_resection <- OS_all[OS_all$type_sx == 0, ]
+PFS_resection <- PFS_all[PFS_all$type_sx == 0, ]
+Fibrosis_resection <- Fibrosis_all[Fibrosis_all$type_sx == 0, ]
+```
+
+### Time to Progression
+
+```{r ttp-resection}
+run_km_cox(TTP_resection, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/TTP_Resection.pdf")
+```
+
+### Overall Survival
+
+```{r os-resection}
+run_km_cox(OS_resection, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/OS_Resection.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-resection}
+run_km_cox(PFS_resection, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/PFS_Resection.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-resection}
+run_fibrosis(Fibrosis_resection, "chip_group", label = "Fibrosis - Resection",
+             table_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_Resection.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_Resection.pdf")
+```
+
+## Transplant Only
+
+```{r subset-transplant}
+TTP_transplant <- TTP_all[TTP_all$type_sx == 1, ]
+OS_transplant <- OS_all[OS_all$type_sx == 1, ]
+PFS_transplant <- PFS_all[PFS_all$type_sx == 1, ]
+Fibrosis_transplant <- Fibrosis_all[Fibrosis_all$type_sx == 1, ]
+```
+
+### Time to Progression
+
+```{r ttp-transplant}
+run_km_cox(TTP_transplant, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/TTP_Transplant.pdf")
+```
+
+### Overall Survival
+
+```{r os-transplant}
+run_km_cox(OS_transplant, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/OS_Transplant.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-transplant}
+run_km_cox(PFS_transplant, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/PFS_Transplant.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-transplant}
+run_fibrosis(Fibrosis_transplant, "chip_group", label = "Fibrosis - Transplant",
+             table_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_Transplant.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/Fibrosis_Transplant.pdf")
+```
+
+# Results (Alternate CHIP Grouping)
+
+This section repeats the exact same outcomes (TTP, OS, PFS, fibrosis) and
+the same three cohorts (All, Resection, Transplant) as the Results section
+above, but using the alternate 3-group classification defined earlier under
+Alternate CHIP Grouping (`chip_group_alt`) instead of the original 4-group
+one. Output files are written to a separate `AltGrouping` subfolder so the
+original Results section's output files are left untouched.
+
+```{r build-outcomes-alt}
+dir.create("Plots/GeneVAF_Subgroups/AltGrouping", showWarnings = FALSE, recursive = TRUE)
+
+TTP_alt <- build_TTP(clinical, group_col = "chip_group_alt")
+OS_alt <- build_OS(clinical, group_col = "chip_group_alt")
+PFS_alt <- build_PFS(clinical, group_col = "chip_group_alt")
+Fibrosis_alt <- build_fibrosis(clinical, group_col = "chip_group_alt")
+```
+
+## All Patients
+
+### Time to Progression
+
+```{r ttp-all-alt}
+run_km_cox(TTP_alt, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP (Alt Grouping) - All",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/TTP_All.pdf")
+```
+
+### Overall Survival
+
+```{r os-all-alt}
+run_km_cox(OS_alt, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS (Alt Grouping) - All",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/OS_All.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-all-alt}
+run_km_cox(PFS_alt, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS (Alt Grouping) - All",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/PFS_All.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-all-alt}
+run_fibrosis(Fibrosis_alt, "chip_group", label = "Fibrosis (Alt Grouping) - All",
+             table_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_All.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_All.pdf")
+```
+
+## Resection Only
+
+```{r subset-resection-alt}
+TTP_resection_alt <- TTP_alt[TTP_alt$type_sx == 0, ]
+OS_resection_alt <- OS_alt[OS_alt$type_sx == 0, ]
+PFS_resection_alt <- PFS_alt[PFS_alt$type_sx == 0, ]
+Fibrosis_resection_alt <- Fibrosis_alt[Fibrosis_alt$type_sx == 0, ]
+```
+
+### Time to Progression
+
+```{r ttp-resection-alt}
+run_km_cox(TTP_resection_alt, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP (Alt Grouping) - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/TTP_Resection.pdf")
+```
+
+### Overall Survival
+
+```{r os-resection-alt}
+run_km_cox(OS_resection_alt, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS (Alt Grouping) - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/OS_Resection.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-resection-alt}
+run_km_cox(PFS_resection_alt, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS (Alt Grouping) - Resection",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/PFS_Resection.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-resection-alt}
+run_fibrosis(Fibrosis_resection_alt, "chip_group", label = "Fibrosis (Alt Grouping) - Resection",
+             table_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_Resection.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_Resection.pdf")
+```
+
+## Transplant Only
+
+```{r subset-transplant-alt}
+TTP_transplant_alt <- TTP_alt[TTP_alt$type_sx == 1, ]
+OS_transplant_alt <- OS_alt[OS_alt$type_sx == 1, ]
+PFS_transplant_alt <- PFS_alt[PFS_alt$type_sx == 1, ]
+Fibrosis_transplant_alt <- Fibrosis_alt[Fibrosis_alt$type_sx == 1, ]
+```
+
+### Time to Progression
+
+```{r ttp-transplant-alt}
+run_km_cox(TTP_transplant_alt, "time", "recurrence", "chip_group",
+           ylab = "Time to Progression", label = "TTP (Alt Grouping) - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/TTP_Transplant.pdf")
+```
+
+### Overall Survival
+
+```{r os-transplant-alt}
+run_km_cox(OS_transplant_alt, "time", "status", "chip_group",
+           ylab = "Overall Survival", label = "OS (Alt Grouping) - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/OS_Transplant.pdf")
+```
+
+### Progression Free Survival
+
+```{r pfs-transplant-alt}
+run_km_cox(PFS_transplant_alt, "time", "progression", "chip_group",
+           ylab = "Progression Free Survival", label = "PFS (Alt Grouping) - Transplant",
+           outfile = "Plots/GeneVAF_Subgroups/AltGrouping/PFS_Transplant.pdf")
+```
+
+### Fibrosis
+
+```{r fibrosis-transplant-alt}
+run_fibrosis(Fibrosis_transplant_alt, "chip_group", label = "Fibrosis (Alt Grouping) - Transplant",
+             table_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_Transplant.csv",
+             plot_outfile = "Plots/GeneVAF_Subgroups/AltGrouping/Fibrosis_Transplant.pdf")
+```
